@@ -17,7 +17,7 @@ export default function TrackRail() {
         return (
           <div
             key={id}
-            className={`flex min-h-[54px] flex-1 flex-col justify-between rounded-lg p-1 ring-1 transition-colors ${
+            className={`flex min-h-[46px] flex-1 flex-col justify-between gap-0.5 rounded-lg p-1 ring-1 transition-colors ${
               isActive ? 'bg-stone-800 ring-stone-600' : 'bg-stone-900/60 ring-stone-800'
             }`}
             style={isActive ? { boxShadow: `inset 3px 0 0 ${meta.color}` } : undefined}
@@ -38,7 +38,7 @@ export default function TrackRail() {
                 aria-label={`Mute ${meta.short}`}
                 aria-pressed={t.muted}
                 onClick={() => updateTrack(id, { muted: !t.muted })}
-                className={`h-6 flex-1 rounded text-[10px] font-bold ${t.muted ? 'bg-rose-500 text-stone-950' : 'bg-stone-950 text-stone-400'}`}
+                className={`h-5 flex-1 rounded text-[10px] font-bold ${t.muted ? 'bg-rose-500 text-stone-950' : 'bg-stone-950 text-stone-400'}`}
               >
                 M
               </button>
@@ -47,7 +47,7 @@ export default function TrackRail() {
                 aria-label={`Solo ${meta.short}`}
                 aria-pressed={t.solo}
                 onClick={() => updateTrack(id, { solo: !t.solo })}
-                className={`h-6 flex-1 rounded text-[10px] font-bold ${t.solo ? 'bg-amber-400 text-stone-950' : 'bg-stone-950 text-stone-400'}`}
+                className={`h-5 flex-1 rounded text-[10px] font-bold ${t.solo ? 'bg-amber-400 text-stone-950' : 'bg-stone-950 text-stone-400'}`}
               >
                 S
               </button>

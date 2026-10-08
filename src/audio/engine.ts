@@ -1,24 +1,24 @@
 import * as Tone from 'tone';
 import { create } from 'zustand';
 import type { InstrumentId, NoteEvent, Track } from '../types';
-import { useStudio } from '../store';
+import { useStudio, useUi } from '../store';
 import { effectiveDuration, INSTRUMENT_ORDER, isAudible, STEPS_PER_BAR } from '../lib/music';
 import { MixerGraph } from './graph';
-import { loadPianoSamples } from './instruments';
+import { loadSampleSet, SAMPLE_SET_FOR, type SampleSetId } from './instruments';
 
 export type SampleStatus = 'idle' | 'loading' | 'ready' | 'fallback';
 
 interface TransportState {
   audioReady: boolean;
   playing: boolean;
-  pianoSamples: SampleStatus;
+  samples: Record<SampleSetId, SampleStatus>;
 }
 
 /** Reactive engine status for the UI. */
 export const useTransport = create<TransportState>(() => ({
   audioReady: false,
   playing: false,
-  pianoSamples: 'idle',
+  samples: { piano: 'idle', violin: 'idle', bass: 'idle' },
 }));
 
 interface ScheduledNote {
@@ -44,14 +44,22 @@ export function stepSeconds(bpm: number) {
   return 60 / bpm / 4;
 }
 
+/** Delay applied to off-beat 16ths for swing (0 → straight, 1 → full triplet shuffle). */
+export function swingOffset(step: number, swing: number, stepSec: number) {
+  return step % 2 === 1 ? swing * stepSec * (1 / 3) : 0;
+}
+
 type NavigatorWithAudioSession = Navigator & { audioSession?: { type: string } };
+type WakeLockSentinelLike = { release: () => Promise<void> };
 
 class AudioEngine {
   private graph: MixerGraph | null = null;
+  private click: Tone.Synth | null = null;
   private initPromise: Promise<void> | null = null;
   private stepIndex = new Map<number, ScheduledNote[]>();
   private repeatId: number | null = null;
   private unsubscribe: (() => void) | null = null;
+  private wakeLock: WakeLockSentinelLike | null = null;
 
   /** Must be called from a user gesture (tap) to unlock audio on mobile browsers. */
   init(): Promise<void> {
@@ -81,6 +89,11 @@ class AudioEngine {
 
     const state = useStudio.getState();
     this.graph = new MixerGraph(state.tracks);
+    this.click = new Tone.Synth({
+      oscillator: { type: 'square' },
+      envelope: { attack: 0.001, decay: 0.03, sustain: 0, release: 0.01 },
+      volume: -16,
+    }).toDestination();
 
     const transport = Tone.getTransport();
     transport.bpm.value = state.bpm;
@@ -100,25 +113,28 @@ class AudioEngine {
       if (s.totalBars !== prev.totalBars) {
         transport.loopEnd = `${s.totalBars}m`;
         if (transport.ticks >= Tone.Time(`${s.totalBars}m`).toTicks()) transport.ticks = 0;
+        if (useUi.getState().cueStep >= s.totalBars * STEPS_PER_BAR) useUi.getState().setCueStep(0);
       }
     });
 
     document.addEventListener('visibilitychange', this.onVisibility);
     useTransport.setState({ audioReady: true });
 
-    // Load the sampled piano in the background; the synth fallback plays meanwhile.
-    this.loadPiano();
+    // Stream the sampled instruments in the background; synth fallbacks play meanwhile.
+    this.loadSamples();
   }
 
-  loadPiano() {
-    useTransport.setState({ pianoSamples: 'loading' });
-    loadPianoSamples().then((ok) => {
-      useTransport.setState({ pianoSamples: ok ? 'ready' : 'fallback' });
-      if (ok && this.graph) {
-        this.graph.replaceVoice('piano');
+  loadSamples() {
+    for (const set of ['piano', 'violin', 'bass'] as SampleSetId[]) {
+      if (useTransport.getState().samples[set] === 'ready') continue;
+      useTransport.setState((s) => ({ samples: { ...s.samples, [set]: 'loading' } }));
+      loadSampleSet(set).then((ok) => {
+        useTransport.setState((s) => ({ samples: { ...s.samples, [set]: ok ? 'ready' : 'fallback' } }));
+        if (!ok || !this.graph) return;
+        for (const id of INSTRUMENT_ORDER) if (SAMPLE_SET_FOR[id] === set) this.graph.replaceVoice(id);
         this.graph.apply(useStudio.getState().tracks);
-      }
-    });
+      });
+    }
   }
 
   private onVisibility = () => {
@@ -128,20 +144,27 @@ class AudioEngine {
   private tick(time: number) {
     const graph = this.graph;
     if (!graph) return;
-    const { tracks, bpm, totalBars } = useStudio.getState();
+    const { tracks, bpm, totalBars, swing = 0 } = useStudio.getState();
     const totalSteps = totalBars * STEPS_PER_BAR;
-    const ticksPerStep = Tone.getTransport().PPQ / 4;
-    const step = Math.round(Tone.getTransport().getTicksAtTime(time) / ticksPerStep) % totalSteps;
+    const transport = Tone.getTransport();
+    const ticksPerStep = transport.PPQ / 4;
+    const step = Math.round(transport.getTicksAtTime(time) / ticksPerStep) % totalSteps;
+    const stepSec = stepSeconds(bpm);
+
+    if (useUi.getState().metronome && step % 4 === 0) {
+      this.click?.triggerAttackRelease(step % STEPS_PER_BAR === 0 ? 'C6' : 'G5', 0.03, time, step % 16 === 0 ? 1 : 0.6);
+    }
+
     const bucket = this.stepIndex.get(step);
     if (!bucket) return;
     const anySolo = INSTRUMENT_ORDER.some((id) => tracks[id].solo);
-    const stepSec = stepSeconds(bpm);
+    const at = time + swingOffset(step, swing, stepSec);
     for (const { trackId, note } of bucket) {
       const track = tracks[trackId];
       if (!isAudible(track, anySolo)) continue;
       const dur = Math.max(0.03, effectiveDuration(note, track) * stepSec - 0.005);
       try {
-        graph.strips[trackId].voice.play(note.pitch, dur, time, note.velocity ?? 0.8);
+        graph.strips[trackId].voice.play(note.pitch, dur, at, note.velocity ?? 0.8);
       } catch (err) {
         console.warn('[audio] note dropped', err);
       }
@@ -150,10 +173,16 @@ class AudioEngine {
 
   async play() {
     await this.init();
-    if (Tone.getContext().state !== 'running') await Tone.getContext().resume();
+    await this.resume();
     const transport = Tone.getTransport();
-    if (transport.state !== 'started') transport.start('+0.05');
+    if (transport.state !== 'started') {
+      const { cueStep } = useUi.getState();
+      const totalSteps = useStudio.getState().totalBars * STEPS_PER_BAR;
+      transport.ticks = (cueStep < totalSteps ? cueStep : 0) * (transport.PPQ / 4);
+      transport.start('+0.05');
+    }
     useTransport.setState({ playing: true });
+    void this.holdWakeLock();
   }
 
   stop() {
@@ -162,11 +191,30 @@ class AudioEngine {
     transport.ticks = 0;
     if (this.graph) for (const id of INSTRUMENT_ORDER) this.graph.strips[id].voice.releaseAll();
     useTransport.setState({ playing: false });
+    void this.wakeLock?.release().catch(() => {});
+    this.wakeLock = null;
   }
 
   toggle() {
     if (useTransport.getState().playing) this.stop();
     else void this.play();
+  }
+
+  /** Jump the playhead (used when tapping the ruler while playing). */
+  seek(step: number) {
+    const transport = Tone.getTransport();
+    if (transport.state === 'started') transport.ticks = step * (transport.PPQ / 4);
+  }
+
+  /** Keep the phone screen awake while the song plays. */
+  private async holdWakeLock() {
+    const wl = (navigator as Navigator & { wakeLock?: { request: (t: 'screen') => Promise<WakeLockSentinelLike> } }).wakeLock;
+    if (!wl || this.wakeLock) return;
+    try {
+      this.wakeLock = await wl.request('screen');
+    } catch {
+      /* denied or unsupported */
+    }
   }
 
   /** Resume a context the OS suspended (iOS backgrounding, phone calls…). */
@@ -208,6 +256,7 @@ class AudioEngine {
     this.unsubscribe?.();
     document.removeEventListener('visibilitychange', this.onVisibility);
     this.graph?.dispose();
+    this.click?.dispose();
     this.graph = null;
     this.initPromise = null;
     useTransport.setState({ audioReady: false, playing: false });

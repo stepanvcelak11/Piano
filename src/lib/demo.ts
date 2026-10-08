@@ -14,18 +14,33 @@ export function emptyTracks(): Record<InstrumentId, Track> {
     piano: track('piano', 'Piano', { sustain: true, volume: -4, reverbSend: 0.3 }),
     violin: track('violin', 'Violin', { volume: -8, reverbSend: 0.35 }),
     viola: track('viola', 'Viola', { volume: -10, reverbSend: 0.35 }),
-    bass: track('bass', 'Bass', { volume: -6, reverbSend: 0.12 }),
+    bass: track('bass', 'Bass', { volume: -6, reverbSend: 0.12, articulation: 'arco' }),
     cajon: track('cajon', 'Cajon', { volume: -6, reverbSend: 0.1 }),
   };
 }
 
 export function emptyProject(): ProjectState {
-  return { bpm: 92, totalBars: 4, activeTrackId: 'piano', showGhostNotes: true, tracks: emptyTracks() };
+  return {
+    name: 'Untitled',
+    bpm: 92,
+    totalBars: 4,
+    activeTrackId: 'piano',
+    showGhostNotes: true,
+    swing: 0,
+    scaleRoot: 0,
+    scaleType: 'chromatic',
+    tracks: emptyTracks(),
+  };
 }
 
 /** A short Am – F – C – G crossover groove so the studio isn't silent on first launch. */
 export function demoProject(): ProjectState {
   const p = emptyProject();
+  p.name = 'Demo – A minor groove';
+  p.scaleRoot = 9;
+  p.scaleType = 'minor';
+  p.swing = 0.15;
+  p.tracks.bass.articulation = 'pizz';
   const chords: string[][] = [
     ['A3', 'C4', 'E4'],
     ['F3', 'A3', 'C4'],

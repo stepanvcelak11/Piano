@@ -66,3 +66,37 @@ describe('demo + persistence', () => {
     expect(fixed.tracks.cajon.notes).toEqual([]);
   });
 });
+
+import { chordFrom, inScale, snapToScale } from '../lib/music';
+import { projectToMidi } from '../lib/midi';
+
+describe('scales & chords', () => {
+  it('knows A minor', () => {
+    expect(inScale(57, 9, 'minor')).toBe(true); // A3
+    expect(inScale(58, 9, 'minor')).toBe(false); // A#3
+    expect(snapToScale(58, 9, 'minor')).toBe(59); // → B3 (tie resolves up)
+  });
+  it('builds diatonic triads and sevenths', () => {
+    expect(chordFrom(57, 'triad', 9, 'minor')).toEqual([57, 60, 64]); // Am
+    expect(chordFrom(53, 'triad', 9, 'minor')).toEqual([53, 57, 60]); // F
+    expect(chordFrom(55, 'seventh', 9, 'minor')).toEqual([55, 59, 62, 65]); // G7
+    expect(chordFrom(60, 'triad', 0, 'chromatic')).toEqual([60, 64, 67]);
+    expect(chordFrom(60, 'octave', 0, 'major')).toEqual([60, 72]);
+  });
+});
+
+describe('MIDI export', () => {
+  it('writes a valid format-1 header with one chunk per track', () => {
+    const bytes = projectToMidi(demoProject());
+    const text = String.fromCharCode(...bytes.slice(0, 4));
+    expect(text).toBe('MThd');
+    const ntrks = (bytes[10] << 8) | bytes[11];
+    expect(ntrks).toBe(6); // tempo + 5 instruments
+    const count = (needle: string) => {
+      let c = 0;
+      for (let i = 0; i < bytes.length - 3; i++) if (String.fromCharCode(...bytes.slice(i, i + 4)) === needle) c++;
+      return c;
+    };
+    expect(count('MTrk')).toBe(6);
+  });
+});

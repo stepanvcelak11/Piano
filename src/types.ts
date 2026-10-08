@@ -10,6 +10,9 @@ export interface NoteEvent {
   velocity?: number;
 }
 
+export type ScaleType = 'chromatic' | 'major' | 'minor' | 'harmonicMinor' | 'dorian' | 'pentatonic';
+export type Articulation = 'arco' | 'pizz';
+
 export interface Track {
   id: InstrumentId;
   name: string;
@@ -18,6 +21,7 @@ export interface Track {
   volume: number; // dB (-60 to +6)
   reverbSend: number; // 0 to 1
   sustain?: boolean; // For piano
+  articulation?: Articulation; // For bass: bowed samples or plucked synth
   notes: NoteEvent[];
 }
 
@@ -27,4 +31,9 @@ export interface ProjectState {
   activeTrackId: InstrumentId;
   showGhostNotes: boolean;
   tracks: Record<InstrumentId, Track>;
+  // --- extensions (optional so older saves stay valid) ---
+  name?: string;
+  swing?: number; // 0 (straight) to 1 (hard shuffle), applied to off-beat 16ths
+  scaleRoot?: number; // 0 = C … 11 = B
+  scaleType?: ScaleType;
 }

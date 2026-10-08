@@ -3,19 +3,24 @@ import { useStudio, useUi, MAX_STEP_W, MIN_STEP_W } from '../store';
 import { engine, useTransport } from '../audio/engine';
 import type { InstrumentId, NoteEvent } from '../types';
 import {
+  chordFrom,
   clamp,
   DEFAULT_VELOCITY,
   INSTRUMENT_ORDER,
   INSTRUMENTS,
+  inScale,
   isBlackKey,
   makeId,
   midiToPitch,
+  pitchToMidi,
   rowsFor,
+  snapToScale,
   STEPS_PER_BAR,
 } from '../lib/music';
 
 const KEYS_W = 52;
 const RULER_H = 22;
+const LANE_H = 64;
 const TAP_SLOP = 7; // px of movement before a touch counts as a drag
 const RESIZE_HANDLE_PX = 14;
 
@@ -24,6 +29,8 @@ const C = {
   rowWhite: '#1c1917',
   rowBlack: '#161412',
   rowC: '#211d1a',
+  rowOut: '#100e0d',
+  rowRoot: '#2a2116',
   stepLine: '#2a2522',
   beatLine: '#3a332e',
   barLine: '#5b5048',
@@ -32,12 +39,15 @@ const C = {
   keyWhite: '#e7e5e4',
   keyBlack: '#292524',
   keyText: '#57534e',
+  keyOut: '#a8a29e',
   playhead: '#fbbf24',
+  cue: '#38bdf8',
+  lane: '#0f0d0c',
   outOfRange: 'rgba(0,0,0,0.45)',
 };
 
 type Gesture =
-  | { kind: 'create'; pointerId: number; noteId: string; start: number; startX: number; startY: number }
+  | { kind: 'create'; pointerId: number; noteIds: string[]; start: number; startX: number; startY: number }
   | { kind: 'resize'; pointerId: number; noteId: string; start: number; origDur: number; startX: number; startY: number; moved: boolean }
   | {
       kind: 'move';
@@ -51,7 +61,18 @@ type Gesture =
       startY: number;
       moved: boolean;
     }
-  | { kind: 'pan'; pointerId: number; lastX: number; lastY: number; startX: number; startY: number; moved: boolean; keyPitch?: string }
+  | {
+      kind: 'pan';
+      pointerId: number;
+      lastX: number;
+      lastY: number;
+      startX: number;
+      startY: number;
+      moved: boolean;
+      keyPitch?: string;
+      fromRuler?: boolean;
+    }
+  | { kind: 'velocity'; pointerId: number; changed: boolean }
   | { kind: 'pinch'; lastMidX: number; lastMidY: number; lastDist: number };
 
 interface View {
@@ -59,11 +80,6 @@ interface View {
   h: number;
   scrollX: number;
   scrollY: number;
-}
-
-function rowHeightFor(trackId: InstrumentId, rowH: number, viewH: number) {
-  if (trackId !== 'cajon') return rowH;
-  return Math.max(rowH * 1.6, Math.floor((viewH - RULER_H) / 4));
 }
 
 export default function PianoRoll() {
@@ -89,19 +105,22 @@ export default function PianoRoll() {
       const ui = useUi.getState();
       const v = view.current;
       const rows = rowsFor(s.activeTrackId);
-      const rowH = rowHeightFor(s.activeTrackId, ui.rowHeight, v.h);
+      const laneH = ui.velocityLane ? LANE_H : 0;
+      const gridW = v.w - KEYS_W;
+      const gridH = Math.max(40, v.h - RULER_H - laneH);
+      const rowH = s.activeTrackId === 'cajon' ? Math.max(ui.rowHeight * 1.6, Math.floor(gridH / 4)) : ui.rowHeight;
       const stepW = ui.stepWidth;
       const totalSteps = s.totalBars * STEPS_PER_BAR;
-      return { s, rows, rowH, stepW, totalSteps };
+      const scaleType = s.scaleType ?? 'chromatic';
+      const scaleRoot = s.scaleRoot ?? 0;
+      return { s, ui, rows, rowH, stepW, totalSteps, laneH, gridW, gridH, scaleType, scaleRoot };
     };
 
     const clampScroll = () => {
-      const { rows, rowH, stepW, totalSteps } = geom();
+      const { rows, rowH, stepW, totalSteps, gridW, gridH } = geom();
       const v = view.current;
-      const maxX = Math.max(0, totalSteps * stepW - (v.w - KEYS_W));
-      const maxY = Math.max(0, rows.length * rowH - (v.h - RULER_H));
-      v.scrollX = clamp(v.scrollX, 0, maxX);
-      v.scrollY = clamp(v.scrollY, 0, maxY);
+      v.scrollX = clamp(v.scrollX, 0, Math.max(0, totalSteps * stepW - gridW));
+      v.scrollY = clamp(v.scrollY, 0, Math.max(0, rows.length * rowH - gridH));
     };
 
     const focusTrack = (id: InstrumentId) => {
@@ -113,11 +132,10 @@ export default function PianoRoll() {
         v.scrollX = saved.x;
         v.scrollY = saved.y;
       } else {
-        const { rows, rowH } = geom();
-        const meta = INSTRUMENTS[id];
-        const focusRow = id === 'cajon' ? 0 : rows.indexOf(midiToPitch(meta.focus));
+        const { rows, rowH, gridH } = geom();
+        const focusRow = id === 'cajon' ? 0 : rows.indexOf(midiToPitch(INSTRUMENTS[id].focus));
         const centreRow = focusRow >= 0 ? focusRow : rows.length / 2;
-        v.scrollY = centreRow * rowH - (v.h - RULER_H) / 2;
+        v.scrollY = centreRow * rowH - gridH / 2;
       }
       clampScroll();
       dirty.current = true;
@@ -126,14 +144,12 @@ export default function PianoRoll() {
     // ---------- drawing ----------
     const draw = (playhead: number | null) => {
       const v = view.current;
-      const { s, rows, rowH, stepW, totalSteps } = geom();
+      const { s, ui, rows, rowH, stepW, totalSteps, laneH, gridW, gridH, scaleType, scaleRoot } = geom();
       const dpr = window.devicePixelRatio || 1;
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
       ctx.fillStyle = C.bg;
       ctx.fillRect(0, 0, v.w, v.h);
 
-      const gridW = v.w - KEYS_W;
-      const gridH = v.h - RULER_H;
       const firstRow = Math.max(0, Math.floor(v.scrollY / rowH));
       const lastRow = Math.min(rows.length - 1, Math.ceil((v.scrollY + gridH) / rowH));
       const firstStep = Math.max(0, Math.floor(v.scrollX / stepW));
@@ -141,6 +157,8 @@ export default function PianoRoll() {
       const rowY = (r: number) => RULER_H + r * rowH - v.scrollY;
       const stepX = (st: number) => KEYS_W + st * stepW - v.scrollX;
       const isCajon = s.activeTrackId === 'cajon';
+      const useScale = !isCajon && scaleType !== 'chromatic';
+      const color = INSTRUMENTS[s.activeTrackId].color;
 
       // Grid area
       ctx.save();
@@ -150,54 +168,56 @@ export default function PianoRoll() {
 
       for (let r = firstRow; r <= lastRow; r++) {
         const p = rows[r];
-        ctx.fillStyle = isCajon ? (r % 2 ? C.rowBlack : C.rowWhite) : isBlackKey(p) ? C.rowBlack : p.startsWith('C') && !p.startsWith('C#') ? C.rowC : C.rowWhite;
+        let fill: string;
+        if (isCajon) fill = r % 2 ? C.rowBlack : C.rowWhite;
+        else if (useScale) {
+          const m = pitchToMidi(p)!;
+          fill = !inScale(m, scaleRoot, scaleType) ? C.rowOut : (m - scaleRoot) % 12 === 0 ? C.rowRoot : C.rowWhite;
+        } else fill = isBlackKey(p) ? C.rowBlack : /^C-?\d+$/.test(p) ? C.rowC : C.rowWhite;
+        ctx.fillStyle = fill;
         ctx.fillRect(KEYS_W, rowY(r), gridW, rowH);
       }
-      // Beyond the song end
       const endX = stepX(totalSteps);
       if (endX < v.w) {
         ctx.fillStyle = C.outOfRange;
         ctx.fillRect(endX, RULER_H, v.w - endX, gridH);
       }
-      // Horizontal row separators
       ctx.fillStyle = C.stepLine;
       for (let r = firstRow; r <= lastRow + 1; r++) ctx.fillRect(KEYS_W, Math.round(rowY(r)) - 0.5, gridW, 1);
-      // Vertical lines
       for (let st = firstStep; st <= lastStep; st++) {
         const x = Math.round(stepX(st)) - 0.5;
         ctx.fillStyle = st % STEPS_PER_BAR === 0 ? C.barLine : st % 4 === 0 ? C.beatLine : C.stepLine;
         ctx.fillRect(x, RULER_H, st % STEPS_PER_BAR === 0 ? 1.5 : 1, gridH);
       }
 
-      const drawNote = (n: NoteEvent, row: number, color: string, ghost: boolean) => {
+      const drawNote = (n: NoteEvent, row: number, noteColor: string, ghost: boolean) => {
         const x = stepX(n.time) + 1;
         const y = rowY(row) + 1;
         const w = Math.max(3, n.duration * stepW - 2);
         const h = rowH - 2;
-        if (x > v.w || x + w < KEYS_W || y > v.h || y + h < RULER_H) return;
-        const r = Math.min(4, h / 3);
+        if (x > v.w || x + w < KEYS_W || y > RULER_H + gridH || y + h < RULER_H) return;
+        const rad = Math.min(4, h / 3);
         ctx.beginPath();
-        ctx.roundRect(x, y, w, h, r);
+        ctx.roundRect(x, y, w, h, rad);
         if (ghost) {
           ctx.globalAlpha = 0.28;
-          ctx.strokeStyle = color;
+          ctx.strokeStyle = noteColor;
           ctx.lineWidth = 1;
           ctx.stroke();
           ctx.globalAlpha = 0.12;
-          ctx.fillStyle = color;
+          ctx.fillStyle = noteColor;
           ctx.fill();
           ctx.globalAlpha = 1;
           return;
         }
         const vel = n.velocity ?? DEFAULT_VELOCITY;
         ctx.globalAlpha = 0.5 + vel * 0.5;
-        ctx.fillStyle = color;
+        ctx.fillStyle = noteColor;
         ctx.fill();
         ctx.globalAlpha = 1;
         ctx.strokeStyle = 'rgba(0,0,0,0.45)';
         ctx.lineWidth = 1;
         ctx.stroke();
-        // resize grip
         if (w > 18) {
           ctx.fillStyle = 'rgba(0,0,0,0.3)';
           ctx.fillRect(x + w - 4, y + 3, 2, h - 6);
@@ -210,7 +230,6 @@ export default function PianoRoll() {
         }
       };
 
-      // Ghost notes from the other pitched tracks
       if (s.showGhostNotes && !isCajon) {
         const rowOf = new Map(rows.map((p, i) => [p, i]));
         for (const id of INSTRUMENT_ORDER) {
@@ -222,20 +241,54 @@ export default function PianoRoll() {
         }
       }
 
-      // Active track notes
       const rowIndex = new Map(rows.map((p, i) => [p, i]));
-      const color = INSTRUMENTS[s.activeTrackId].color;
-      for (const n of s.tracks[s.activeTrackId].notes) {
+      const activeNotes = s.tracks[s.activeTrackId].notes;
+      for (const n of activeNotes) {
         const r = rowIndex.get(n.pitch);
         if (r !== undefined && r >= firstRow - 1 && r <= lastRow + 1) drawNote(n, r, color, false);
       }
 
       if (playhead !== null) {
-        const x = stepX(playhead);
         ctx.fillStyle = C.playhead;
-        ctx.fillRect(x - 1, RULER_H, 2, gridH);
+        ctx.fillRect(stepX(playhead) - 1, RULER_H, 2, gridH);
       }
       ctx.restore();
+
+      // Velocity lane
+      if (laneH > 0) {
+        const top = RULER_H + gridH;
+        ctx.save();
+        ctx.fillStyle = C.lane;
+        ctx.fillRect(0, top, v.w, laneH);
+        ctx.fillStyle = C.barLine;
+        ctx.fillRect(0, top, v.w, 1);
+        ctx.fillStyle = C.rulerText;
+        ctx.font = '700 10px ui-sans-serif, system-ui, sans-serif';
+        ctx.textBaseline = 'middle';
+        ctx.fillText('VEL', 10, top + laneH / 2);
+        ctx.beginPath();
+        ctx.rect(KEYS_W, top + 1, gridW, laneH - 1);
+        ctx.clip();
+        for (let st = firstStep - (firstStep % 4); st <= lastStep; st += 4) {
+          ctx.fillStyle = st % STEPS_PER_BAR === 0 ? C.barLine : C.stepLine;
+          ctx.fillRect(Math.round(stepX(st)) - 0.5, top, 1, laneH);
+        }
+        const usable = laneH - 12;
+        for (const n of activeNotes) {
+          if (n.time < firstStep - 1 || n.time > lastStep) continue;
+          const vel = n.velocity ?? DEFAULT_VELOCITY;
+          const x = stepX(n.time) + Math.min(6, stepW / 2);
+          const y = top + 6 + usable * (1 - vel);
+          ctx.fillStyle = color;
+          ctx.globalAlpha = 0.85;
+          ctx.fillRect(x - 1, y, 2, top + laneH - 4 - y);
+          ctx.globalAlpha = 1;
+          ctx.beginPath();
+          ctx.arc(x, y, 3.5, 0, Math.PI * 2);
+          ctx.fill();
+        }
+        ctx.restore();
+      }
 
       // Ruler
       ctx.save();
@@ -258,15 +311,20 @@ export default function PianoRoll() {
           ctx.fillRect(x, RULER_H - 6, 1, 6);
         }
       }
-      if (playhead !== null) {
-        const x = stepX(playhead);
-        ctx.fillStyle = C.playhead;
+      const marker = (x: number, fill: string) => {
+        ctx.fillStyle = fill;
         ctx.beginPath();
         ctx.moveTo(x - 6, 0);
         ctx.lineTo(x + 6, 0);
         ctx.lineTo(x, 9);
         ctx.fill();
+      };
+      if (ui.cueStep > 0 && ui.cueStep < totalSteps) {
+        const x = stepX(ui.cueStep);
+        marker(x, C.cue);
+        ctx.fillRect(x - 0.5, 0, 1, RULER_H);
       }
+      if (playhead !== null) marker(stepX(playhead), C.playhead);
       ctx.fillStyle = C.barLine;
       ctx.fillRect(KEYS_W, RULER_H - 1, gridW, 1);
       ctx.restore();
@@ -299,13 +357,19 @@ export default function PianoRoll() {
           ctx.fillStyle = '#d6d3d1';
           ctx.fillRect(KEYS_W * 0.62, y + rowH / 2, KEYS_W * 0.38 - 2, 1);
         }
+        const m = pitchToMidi(p)!;
+        if (useScale && inScale(m, scaleRoot, scaleType)) {
+          // in-key marker on the keyboard edge
+          ctx.fillStyle = (m - scaleRoot) % 12 === 0 ? '#f59e0b' : 'rgba(245,158,11,0.45)';
+          ctx.fillRect(KEYS_W - 4, y + 1, 2, rowH - 2);
+        }
         const isC = /^C-?\d+$/.test(p);
         if (!black && (isC || rowH >= 20)) {
-          ctx.fillStyle = isC ? '#1c1917' : C.keyText;
+          ctx.fillStyle = isC ? '#1c1917' : useScale && !inScale(m, scaleRoot, scaleType) ? C.keyOut : C.keyText;
           ctx.font = `${isC ? 700 : 500} ${Math.min(10, rowH - 6)}px ui-sans-serif, system-ui, sans-serif`;
           ctx.textBaseline = 'middle';
           ctx.textAlign = 'right';
-          ctx.fillText(p, KEYS_W - 6, y + rowH / 2);
+          ctx.fillText(p, KEYS_W - 7, y + rowH / 2);
           ctx.textAlign = 'left';
         }
       }
@@ -314,7 +378,7 @@ export default function PianoRoll() {
       // Corner
       ctx.fillStyle = C.ruler;
       ctx.fillRect(0, 0, KEYS_W, RULER_H);
-      ctx.fillStyle = INSTRUMENTS[s.activeTrackId].color;
+      ctx.fillStyle = color;
       ctx.fillRect(8, RULER_H / 2 - 3, 6, 6);
     };
 
@@ -323,10 +387,10 @@ export default function PianoRoll() {
       const playhead = engine.playheadStep();
       if (playhead !== null && !gesture.current) {
         // Follow the playhead page-by-page.
-        const { stepW } = geom();
+        const { stepW, gridW } = geom();
         const v = view.current;
         const x = playhead * stepW;
-        if (x < v.scrollX || x > v.scrollX + (v.w - KEYS_W) - 8) {
+        if (x < v.scrollX || x > v.scrollX + gridW - 8) {
           v.scrollX = x - 8;
           clampScroll();
         }
@@ -366,24 +430,47 @@ export default function PianoRoll() {
       return { step, row, pitch: rows[row] as string | undefined };
     };
 
+    /** Apply scale lock to a row pitch. */
+    const lockPitch = (pitch: string): string => {
+      const { s, ui, scaleRoot, scaleType } = geom();
+      if (!ui.scaleLock || s.activeTrackId === 'cajon' || scaleType === 'chromatic') return pitch;
+      const m = pitchToMidi(pitch);
+      if (m === null) return pitch;
+      const [lo, hi] = INSTRUMENTS[s.activeTrackId].range;
+      let snapped = snapToScale(m, scaleRoot, scaleType);
+      if (snapped > hi) snapped = snapToScale(m - 1, scaleRoot, scaleType);
+      if (snapped < lo) snapped = snapToScale(m + 1, scaleRoot, scaleType);
+      return midiToPitch(clamp(snapped, lo, hi));
+    };
+
     const noteAt = (x: number, y: number) => {
-      const { s, rows, stepW, rowH } = geom();
+      const { s, rows, stepW } = geom();
       const v = view.current;
       const { row } = cellAt(x, y);
       const pitch = rows[row];
       if (!pitch) return null;
       const pos = (x - KEYS_W + v.scrollX) / stepW;
       const notes = s.tracks[s.activeTrackId].notes;
-      // Topmost (last drawn) note wins.
       for (let i = notes.length - 1; i >= 0; i--) {
         const n = notes[i];
         if (n.pitch === pitch && pos >= n.time && pos < n.time + n.duration) {
           const rightEdgePx = (n.time + n.duration) * stepW - v.scrollX + KEYS_W;
           const nearEnd = rightEdgePx - x < Math.min(RESIZE_HANDLE_PX, (n.duration * stepW) / 2.5);
-          return { note: n, row, nearEnd, rowH };
+          return { note: n, row, nearEnd };
         }
       }
       return null;
+    };
+
+    const paintVelocity = (x: number, y: number): boolean => {
+      const { s, gridH, laneH, stepW } = geom();
+      const step = Math.floor((x - KEYS_W + view.current.scrollX) / stepW);
+      const top = RULER_H + gridH;
+      const vel = Math.round(clamp(1 - (y - top - 6) / (laneH - 12), 0.05, 1) * 100) / 100;
+      const ids = s.tracks[s.activeTrackId].notes.filter((n) => n.time === step && n.velocity !== vel).map((n) => n.id);
+      if (!ids.length) return false;
+      s.updateNotes(s.activeTrackId, ids, { velocity: vel });
+      return true;
     };
 
     const pan = (dx: number, dy: number) => {
@@ -395,13 +482,18 @@ export default function PianoRoll() {
 
     const startPinch = () => {
       const g = gesture.current;
-      if (g && (g.kind === 'create' || g.kind === 'move' || g.kind === 'resize')) {
-        useStudio.getState().revert();
+      if (g && (g.kind === 'create' || g.kind === 'move' || g.kind === 'resize')) useStudio.getState().revert();
+      if (g && g.kind === 'velocity') {
+        if (g.changed) useStudio.getState().revert();
+        else useStudio.getState().dropCheckpoint();
       }
       const pts = [...pointers.current.values()];
-      const midX = (pts[0].x + pts[1].x) / 2;
-      const midY = (pts[0].y + pts[1].y) / 2;
-      gesture.current = { kind: 'pinch', lastMidX: midX, lastMidY: midY, lastDist: Math.abs(pts[0].x - pts[1].x) };
+      gesture.current = {
+        kind: 'pinch',
+        lastMidX: (pts[0].x + pts[1].x) / 2,
+        lastMidY: (pts[0].y + pts[1].y) / 2,
+        lastDist: Math.abs(pts[0].x - pts[1].x),
+      };
     };
 
     const onPointerDown = (e: PointerEvent) => {
@@ -412,11 +504,17 @@ export default function PianoRoll() {
       if (pointers.current.size === 2) return startPinch();
       if (pointers.current.size > 2) return;
 
-      const studio = useStudio.getState();
-      const ui = useUi.getState();
+      const { s: studio, ui, totalSteps, gridH, laneH, scaleRoot, scaleType } = geom();
       const trackId = studio.activeTrackId;
       const base = { pointerId: e.pointerId, startX: p.x, startY: p.y };
 
+      // Velocity lane: paint velocities.
+      if (laneH > 0 && p.y > RULER_H + gridH) {
+        if (p.x < KEYS_W) return;
+        studio.checkpoint();
+        gesture.current = { kind: 'velocity', pointerId: e.pointerId, changed: paintVelocity(p.x, p.y) };
+        return;
+      }
       // Keyboard column: tap to audition, drag to scroll vertically.
       if (p.x < KEYS_W && p.y > RULER_H) {
         const { pitch } = cellAt(KEYS_W, p.y);
@@ -424,13 +522,16 @@ export default function PianoRoll() {
         if (pitch) engine.preview(trackId, pitch, 4, ui.velocity);
         return;
       }
-      // Ruler or pan tool: pan.
-      if (p.y < RULER_H || ui.tool === 'pan') {
+      // Ruler: tap to set the start position, drag to scroll.
+      if (p.y < RULER_H) {
+        gesture.current = { kind: 'pan', ...base, lastX: p.x, lastY: p.y, moved: false, fromRuler: true };
+        return;
+      }
+      if (ui.tool === 'pan') {
         gesture.current = { kind: 'pan', ...base, lastX: p.x, lastY: p.y, moved: false };
         return;
       }
 
-      const { totalSteps } = geom();
       const hit = noteAt(p.x, p.y);
       if (hit) {
         studio.checkpoint();
@@ -441,17 +542,27 @@ export default function PianoRoll() {
         return;
       }
 
-      const { step, pitch } = cellAt(p.x, p.y);
-      if (!pitch || step < 0 || step >= totalSteps) {
+      const cell = cellAt(p.x, p.y);
+      if (!cell.pitch || cell.step < 0 || cell.step >= totalSteps) {
         gesture.current = { kind: 'pan', ...base, lastX: p.x, lastY: p.y, moved: false };
         return;
       }
-      studio.checkpoint();
+      const step = cell.step;
+      const pitch = lockPitch(cell.pitch);
       const duration = trackId === 'cajon' ? 1 : Math.min(ui.noteLength, totalSteps - step);
-      const note: NoteEvent = { id: makeId(), pitch, time: step, duration, velocity: ui.velocity };
-      studio.addNote(trackId, note);
-      engine.preview(trackId, pitch, duration, ui.velocity);
-      gesture.current = { kind: 'create', ...base, noteId: note.id, start: step };
+      let pitches = [pitch];
+      if (trackId !== 'cajon' && ui.chordMode !== 'single') {
+        const [lo, hi] = INSTRUMENTS[trackId].range;
+        pitches = chordFrom(pitchToMidi(pitch)!, ui.chordMode, scaleRoot, scaleType)
+          .filter((m) => m >= lo && m <= hi)
+          .map(midiToPitch);
+      }
+      studio.checkpoint();
+      const notes: NoteEvent[] = pitches.map((pt) => ({ id: makeId(), pitch: pt, time: step, duration, velocity: ui.velocity }));
+      studio.addNotes(trackId, notes);
+      for (const n of notes) engine.preview(trackId, n.pitch, duration, ui.velocity);
+      navigator.vibrate?.(6);
+      gesture.current = { kind: 'create', ...base, noteIds: notes.map((n) => n.id), start: step };
     };
 
     const onPointerMove = (e: PointerEvent) => {
@@ -485,6 +596,10 @@ export default function PianoRoll() {
         return;
       }
       if (e.pointerId !== g.pointerId) return;
+      if (g.kind === 'velocity') {
+        if (paintVelocity(p.x, p.y)) g.changed = true;
+        return;
+      }
       const travelled = Math.hypot(p.x - g.startX, p.y - g.startY) > TAP_SLOP;
       const studio = useStudio.getState();
       const trackId = studio.activeTrackId;
@@ -495,7 +610,7 @@ export default function PianoRoll() {
           if (!g.moved && !travelled) return;
           g.moved = true;
           const keysOnly = g.keyPitch !== undefined;
-          pan(keysOnly ? 0 : p.x - g.lastX, p.y - g.lastY);
+          pan(keysOnly ? 0 : p.x - g.lastX, g.fromRuler ? 0 : p.y - g.lastY);
           g.lastX = p.x;
           g.lastY = p.y;
           return;
@@ -509,7 +624,8 @@ export default function PianoRoll() {
           if (trackId === 'cajon') return;
           const { step } = cellAt(p.x, p.y);
           const dur = clamp(step - g.start + 1, 1, totalSteps - g.start);
-          studio.updateNote(trackId, g.noteId, { duration: dur });
+          if (g.kind === 'create') studio.updateNotes(trackId, g.noteIds, { duration: dur });
+          else studio.updateNote(trackId, g.noteId, { duration: dur });
           return;
         }
         case 'move': {
@@ -518,7 +634,7 @@ export default function PianoRoll() {
           const { step, row } = cellAt(p.x, p.y);
           const time = clamp(g.orig.time + (step - g.grabStep), 0, Math.max(0, totalSteps - g.orig.duration));
           const newRow = clamp(g.origRow + (row - g.grabRow), 0, rows.length - 1);
-          const pitch = rows[newRow];
+          const pitch = lockPitch(rows[newRow]);
           const cur = studio.tracks[trackId].notes.find((n) => n.id === g.noteId);
           if (cur && (cur.time !== time || cur.pitch !== pitch)) {
             if (cur.pitch !== pitch) engine.preview(trackId, pitch, 1, cur.velocity ?? DEFAULT_VELOCITY);
@@ -542,18 +658,31 @@ export default function PianoRoll() {
       gesture.current = null;
       const studio = useStudio.getState();
       const cancelled = e.type === 'pointercancel';
+
+      if (g.kind === 'velocity') {
+        if (!g.changed) studio.dropCheckpoint();
+        return;
+      }
+      if (g.kind === 'pan') {
+        if (g.fromRuler && !g.moved && !cancelled) {
+          const { stepW, totalSteps } = geom();
+          const step = clamp(Math.round((g.startX - KEYS_W + view.current.scrollX) / stepW), 0, totalSteps - 1);
+          const ui = useUi.getState();
+          // Tapping the current cue again clears it.
+          ui.setCueStep(Math.abs(step - ui.cueStep) <= 1 && ui.cueStep !== 0 ? 0 : step);
+          engine.seek(useUi.getState().cueStep);
+          dirty.current = true;
+        }
+        return;
+      }
       if (g.kind === 'create' && cancelled) studio.revert();
       if ((g.kind === 'move' || g.kind === 'resize') && !g.moved) {
-        // Tap on a note deletes it.
         if (cancelled) studio.dropCheckpoint();
-        else studio.removeNote(studio.activeTrackId, g.noteId);
+        else studio.removeNote(studio.activeTrackId, g.noteId); // tap on a note deletes it
       } else if (g.kind === 'move' || g.kind === 'resize') {
         const n = studio.tracks[studio.activeTrackId].notes.find((x) => x.id === g.noteId);
         const unchanged =
-          n &&
-          (g.kind === 'move'
-            ? n.time === g.orig.time && n.pitch === g.orig.pitch
-            : n.duration === g.origDur);
+          n && (g.kind === 'move' ? n.time === g.orig.time && n.pitch === g.orig.pitch : n.duration === g.origDur);
         if (unchanged) studio.dropCheckpoint();
       }
     };
@@ -595,15 +724,14 @@ export default function PianoRoll() {
       dirty.current = true;
     });
     const unsubUi = useUi.subscribe((s, prev) => {
-      if (s.stepWidth !== prev.stepWidth || s.rowHeight !== prev.rowHeight) {
-        if (s.rowHeight !== prev.rowHeight) {
-          // keep the vertical centre stable when zooming rows
-          const v = view.current;
-          const centre = (v.scrollY + (v.h - RULER_H) / 2) / prev.rowHeight;
-          v.scrollY = centre * s.rowHeight - (v.h - RULER_H) / 2;
-        }
-        clampScroll();
+      if (s.rowHeight !== prev.rowHeight) {
+        // keep the vertical centre stable when zooming rows
+        const v = view.current;
+        const { gridH } = geom();
+        const centre = (v.scrollY + gridH / 2) / prev.rowHeight;
+        v.scrollY = centre * s.rowHeight - gridH / 2;
       }
+      clampScroll();
       dirty.current = true;
     });
     const unsubTransport = useTransport.subscribe(() => (dirty.current = true));
@@ -630,7 +758,7 @@ export default function PianoRoll() {
       <canvas
         ref={canvasRef}
         className="no-touch absolute inset-0 block"
-        aria-label="Piano roll. Tap an empty cell to add a note, drag to lengthen, tap a note to delete, drag a note to move it, drag its right edge to resize. Two fingers to scroll and zoom."
+        aria-label="Piano roll. Tap an empty cell to add a note, drag to lengthen, tap a note to delete, drag a note to move it, drag its right edge to resize. Tap the ruler to set where playback starts. Two fingers to scroll and zoom."
         role="application"
       />
     </div>

@@ -1,4 +1,4 @@
-import type { CajonHit, InstrumentId, NoteEvent, Track } from '../types';
+import type { CajonHit, InstrumentId, NoteEvent, ScaleType, Track } from '../types';
 
 export const STEPS_PER_BAR = 16;
 export const MIN_BPM = 40;
@@ -98,4 +98,57 @@ export function effectiveDuration(note: NoteEvent, track: Track): number {
 /** Does a note overlap the given cell (same pitch)? */
 export function noteCovers(note: NoteEvent, pitch: string, step: number): boolean {
   return note.pitch === pitch && step >= note.time && step < note.time + note.duration;
+}
+
+// ---------------------------------------------------------------------------
+// Scales & chords
+// ---------------------------------------------------------------------------
+
+
+export const ROOT_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'];
+
+export const SCALES: Record<ScaleType, { label: string; steps: number[] }> = {
+  chromatic: { label: 'Chromatic', steps: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11] },
+  major: { label: 'Major', steps: [0, 2, 4, 5, 7, 9, 11] },
+  minor: { label: 'Natural minor', steps: [0, 2, 3, 5, 7, 8, 10] },
+  harmonicMinor: { label: 'Harmonic minor', steps: [0, 2, 3, 5, 7, 8, 11] },
+  dorian: { label: 'Dorian', steps: [0, 2, 3, 5, 7, 9, 10] },
+  pentatonic: { label: 'Pentatonic', steps: [0, 2, 4, 7, 9] },
+};
+
+export function inScale(midi: number, root: number, type: ScaleType): boolean {
+  return SCALES[type].steps.includes((((midi - root) % 12) + 12) % 12);
+}
+
+/** Nearest in-scale MIDI note (ties resolve upward). */
+export function snapToScale(midi: number, root: number, type: ScaleType): number {
+  for (let d = 0; d <= 6; d++) {
+    if (inScale(midi + d, root, type)) return midi + d;
+    if (inScale(midi - d, root, type)) return midi - d;
+  }
+  return midi;
+}
+
+export type ChordMode = 'single' | 'triad' | 'seventh' | 'octave';
+
+/**
+ * Notes of a chord built on `midi`: diatonic stacked thirds in the current scale,
+ * or a major (7th) chord when the scale is chromatic / pentatonic.
+ */
+export function chordFrom(midi: number, mode: ChordMode, root: number, type: ScaleType): number[] {
+  if (mode === 'single') return [midi];
+  if (mode === 'octave') return [midi, midi + 12];
+  const size = mode === 'triad' ? 3 : 4;
+  if (type === 'chromatic' || type === 'pentatonic') return [0, 4, 7, 11].slice(0, size).map((i) => midi + i);
+  const base = snapToScale(midi, root, type);
+  const steps = SCALES[type].steps;
+  const rel = (((base - root) % 12) + 12) % 12;
+  const degree = steps.indexOf(rel);
+  const out: number[] = [];
+  for (let k = 0; k < size; k++) {
+    const idx = degree + k * 2;
+    const octave = Math.floor(idx / steps.length);
+    out.push(base - rel + steps[idx % steps.length] + octave * 12);
+  }
+  return out;
 }

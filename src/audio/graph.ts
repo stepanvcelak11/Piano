@@ -22,7 +22,7 @@ export class MixerGraph {
 
   constructor(tracks: Record<InstrumentId, Track>, destination: Tone.InputNode = Tone.getDestination()) {
     this.limiter = new Tone.Limiter(-1).connect(destination);
-    this.master = new Tone.Gain(0.9).connect(this.limiter);
+    this.master = new Tone.Gain(1.5).connect(this.limiter);
     this.reverb = new Tone.Reverb({ decay: 2.8, preDelay: 0.025, wet: 1 }).connect(this.master);
 
     const strips = {} as Record<InstrumentId, TrackStrip>;
@@ -54,6 +54,7 @@ export class MixerGraph {
       if (rampTime > 0) s.send.gain.rampTo(t.reverbSend, rampTime);
       else s.send.gain.value = t.reverbSend;
       s.voice.setSustain?.(!!t.sustain);
+      s.voice.setArticulation?.(t.articulation ?? 'arco');
     }
   }
 

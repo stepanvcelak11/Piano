@@ -11,53 +11,73 @@ export interface InstrumentVoice {
   play: (pitch: string, duration: number, time: number, velocity: number) => void;
   releaseAll: (time?: number) => void;
   setSustain?: (on: boolean) => void;
+  setArticulation?: (a: 'arco' | 'pizz') => void;
   dispose: () => void;
 }
 
 // ---------------------------------------------------------------------------
-// Piano samples (Salamander Grand, hosted by the Tone.js project)
+// Bundled samples (served from /samples next to the app, so they work offline)
+//   piano  – Salamander Grand Piano V3 (Alexander Holm, CC-BY 3.0)
+//   violin – Philharmonia Orchestra samples via nbrosowsky/tonejs-instruments
+//   bass   – Philharmonia Orchestra contrabass (arco)
 // ---------------------------------------------------------------------------
 
-export const PIANO_SAMPLE_BASE_URL = 'https://tonejs.github.io/audio/salamander/';
+export type SampleSetId = 'piano' | 'violin' | 'bass';
 
-function pianoSampleMap(): Record<string, string> {
-  const map: Record<string, string> = { A0: 'A0.mp3', C8: 'C8.mp3' };
-  for (let oct = 1; oct <= 7; oct++) {
-    map[`C${oct}`] = `C${oct}.mp3`;
-    map[`D#${oct}`] = `Ds${oct}.mp3`;
-    map[`F#${oct}`] = `Fs${oct}.mp3`;
-    map[`A${oct}`] = `A${oct}.mp3`;
-  }
-  return map;
+const SAMPLE_FILES: Record<SampleSetId, string[]> = {
+  piano: [
+    'A0', 'C1', 'Ds1', 'Fs1', 'A1', 'C2', 'Ds2', 'Fs2', 'A2', 'C3', 'Ds3', 'Fs3', 'A3', 'C4', 'Ds4', 'Fs4',
+    'A4', 'C5', 'Ds5', 'Fs5', 'A5', 'C6', 'Ds6', 'Fs6', 'A6', 'C7', 'Ds7', 'Fs7', 'A7', 'C8',
+  ],
+  violin: ['G3', 'A3', 'C4', 'E4', 'G4', 'A4', 'C5', 'E5', 'G5', 'A5', 'C6', 'E6', 'G6', 'A6', 'C7'],
+  bass: ['Fs1', 'G1', 'As1', 'C2', 'D2', 'E2', 'Fs2', 'Gs2', 'A2', 'Cs3', 'E3', 'Gs3', 'B3'],
+};
+
+/** Which sample set each instrument plays. */
+export const SAMPLE_SET_FOR: Partial<Record<InstrumentId, SampleSetId>> = {
+  piano: 'piano',
+  violin: 'violin',
+  viola: 'violin',
+  bass: 'bass',
+};
+
+export function sampleBaseUrl(): string {
+  return `${import.meta.env.BASE_URL ?? './'}samples/`;
 }
 
-/** Decoded piano buffers. AudioBuffers are context-independent so they are shared with offline renders. */
-let pianoBuffers: Record<string, Tone.ToneAudioBuffer> | null = null;
-let pianoLoad: Promise<boolean> | null = null;
+/** Decoded buffers. AudioBuffers are context-independent so they are shared with offline renders. */
+const buffers: Partial<Record<SampleSetId, Record<string, Tone.ToneAudioBuffer>>> = {};
+const loading: Partial<Record<SampleSetId, Promise<boolean>>> = {};
 
-export function pianoSamplesReady(): boolean {
-  return pianoBuffers !== null;
+export function samplesReady(set: SampleSetId): boolean {
+  return !!buffers[set];
 }
 
-export function loadPianoSamples(): Promise<boolean> {
-  if (pianoLoad) return pianoLoad;
-  const map = pianoSampleMap();
-  pianoLoad = Promise.all(
-    Object.entries(map).map(async ([note, file]) => {
-      const buf = await Tone.ToneAudioBuffer.load(PIANO_SAMPLE_BASE_URL + file);
-      return [note, new Tone.ToneAudioBuffer(buf)] as const;
+export function loadSampleSet(set: SampleSetId): Promise<boolean> {
+  const pending = loading[set];
+  if (pending) return pending;
+  const base = sampleBaseUrl();
+  const p = Promise.all(
+    SAMPLE_FILES[set].map(async (file) => {
+      const buf = await Tone.ToneAudioBuffer.load(`${base}${set}/${file}.mp3`);
+      return [file.replace('s', '#'), new Tone.ToneAudioBuffer(buf)] as const;
     }),
   )
     .then((entries) => {
-      pianoBuffers = Object.fromEntries(entries);
+      buffers[set] = Object.fromEntries(entries);
       return true;
     })
     .catch((err) => {
-      console.warn('[audio] Piano samples unavailable, using synthesized piano.', err);
-      pianoLoad = null; // allow a retry later (e.g. when back online)
+      console.warn(`[audio] ${set} samples unavailable, using synthesized fallback.`, err);
+      delete loading[set]; // allow a retry later
       return false;
     });
-  return pianoLoad;
+  loading[set] = p;
+  return p;
+}
+
+export function loadAllSamples(): Promise<boolean[]> {
+  return Promise.all((Object.keys(SAMPLE_FILES) as SampleSetId[]).map(loadSampleSet));
 }
 
 // ---------------------------------------------------------------------------
@@ -68,6 +88,7 @@ function createPiano(dest: Tone.InputNode): InstrumentVoice {
   const eq = new Tone.EQ3({ low: 1, mid: 0, high: -2 }).connect(dest);
   let sustain = false;
 
+  const pianoBuffers = buffers.piano;
   if (pianoBuffers) {
     const sampler = new Tone.Sampler({ urls: pianoBuffers, release: 0.8, curve: 'exponential' }).connect(eq);
     return {
@@ -112,6 +133,25 @@ function createStrings(dest: Tone.InputNode, kind: 'violin' | 'viola'): Instrume
   const bright = kind === 'violin';
   const body = new Tone.Filter({ type: 'lowpass', frequency: bright ? 5200 : 3400, Q: 0.7 }).connect(dest);
   const formant = new Tone.Filter({ type: 'peaking', frequency: bright ? 2800 : 1600, gain: 4, Q: 1.2 }).connect(body);
+
+  const violinBuffers = buffers.violin;
+  if (violinBuffers) {
+    // Viola: the violin recordings played lower, with the top end rolled off and more body.
+    body.frequency.value = bright ? 9000 : 3800;
+    formant.set(bright ? { frequency: 3000, gain: 0 } : { frequency: 420, gain: 3.5, Q: 0.9 });
+    const sampler = new Tone.Sampler({ urls: violinBuffers, attack: 0.03, release: 0.35, curve: 'exponential' }).connect(formant);
+    sampler.volume.value = bright ? -2 : 0;
+    return {
+      play: (pitch, dur, time, vel) => sampler.triggerAttackRelease(pitch, dur, time, vel),
+      releaseAll: (time) => sampler.releaseAll(time),
+      dispose: () => {
+        sampler.dispose();
+        formant.dispose();
+        body.dispose();
+      },
+    };
+  }
+
   const synth = new Tone.PolySynth(Tone.DuoSynth, {
     harmonicity: 1.006,
     vibratoAmount: bright ? 0.18 : 0.14,
@@ -143,9 +183,15 @@ function createStrings(dest: Tone.InputNode, kind: 'violin' | 'viola'): Instrume
   };
 }
 
-/** Plucked upright (pizzicato) bass. */
+/** Upright bass: bowed (arco) samples, or a plucked (pizzicato) synth. */
 function createBass(dest: Tone.InputNode): InstrumentVoice {
   const eq = new Tone.EQ3({ low: 3, mid: -1, high: -6, lowFrequency: 180 }).connect(dest);
+  const arcoBuffers = buffers.bass;
+  const arco = arcoBuffers
+    ? new Tone.Sampler({ urls: arcoBuffers, attack: 0.02, release: 0.3, curve: 'exponential' }).connect(eq)
+    : null;
+  if (arco) arco.volume.value = 2;
+  let articulation: 'arco' | 'pizz' = 'arco';
   const synth = new Tone.PolySynth(Tone.MonoSynth, {
     oscillator: { type: 'fattriangle', count: 2, spread: 12 },
     envelope: { attack: 0.004, decay: 1.2, sustain: 0.12, release: 0.35 },
@@ -156,10 +202,18 @@ function createBass(dest: Tone.InputNode): InstrumentVoice {
   synth.volume.value = -4;
   synth.connect(eq);
   return {
-    play: (pitch, dur, time, vel) => synth.triggerAttackRelease(pitch, dur, time, vel),
-    releaseAll: (time) => synth.releaseAll(time),
+    play: (pitch, dur, time, vel) => {
+      if (arco && articulation === 'arco') arco.triggerAttackRelease(pitch, dur, time, vel);
+      else synth.triggerAttackRelease(pitch, dur, time, vel);
+    },
+    releaseAll: (time) => {
+      synth.releaseAll(time);
+      arco?.releaseAll(time);
+    },
+    setArticulation: (a) => (articulation = a),
     dispose: () => {
       synth.dispose();
+      arco?.dispose();
       eq.dispose();
     },
   };

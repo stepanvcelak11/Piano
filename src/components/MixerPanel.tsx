@@ -49,6 +49,16 @@ export default function MixerPanel() {
                         PEDAL
                       </button>
                     )}
+                    {id === 'bass' && (
+                      <button
+                        type="button"
+                        onClick={() => updateTrack(id, { articulation: t.articulation === 'pizz' ? 'arco' : 'pizz' })}
+                        className="h-7 rounded bg-sky-400 px-2 text-[11px] font-bold text-stone-950"
+                        title="Bowed (arco) or plucked (pizzicato)"
+                      >
+                        {t.articulation === 'pizz' ? 'PIZZ' : 'ARCO'}
+                      </button>
+                    )}
                     <button
                       type="button"
                       aria-label={`Mute ${meta.name}`}
